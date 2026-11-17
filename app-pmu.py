@@ -289,14 +289,14 @@ def do_integrity_audit_background():
                 "Payout rows are allowed to be absent for races without published payouts."
             ]
         }
-        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v2.json",
+        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v3.json",
                       Body=json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
                       ContentType="application/json")
-        log.info("Row-level integrity audit completed: status=%s course_rows=%s unique_course_keys=%s duplicate_course_keys=%s missing_course_keys=%s finalized_without_arrival=%s participant_rows=%s participant_orphans=%s report_rows=%s report_orphans=%s unique_reunion_keys=%s duplicate_reunion_keys=%s reunion_missing=%s runner_count_mismatches=%s",
+        log.info("Row-level integrity audit completed: status=%s course_rows=%s unique_course_keys=%s duplicate_course_keys=%s missing_course_keys=%s finalized_without_arrival=%s participant_rows=%s participant_orphans=%s report_rows=%s report_orphans=%s unique_reunion_keys=%s duplicate_reunion_keys=%s reunion_missing=%s runner_count_mismatches=%s mismatch_examples=%s",
                  report["status"], course_rows, len(course_keys), duplicate_course_keys, missing_course_key,
-                 finalized_without_arrival, participant_rows, orphan_participant_rows, report_rows,
+                 finalized_without_arrival, participant_rows, orphan_report_rows, report_rows,
                  orphan_report_rows, len(reunion_keys), duplicate_reunion_keys, missing_reunion_refs,
-                 len(runner_count_mismatches))
+                 len(runner_count_mismatches), json.dumps(runner_count_mismatches[:25], ensure_ascii=False))
     except Exception:
         log.exception("Row-level integrity audit failed")
 
@@ -527,7 +527,7 @@ def resume_dataset_import():
                 threading.Thread(target=do_audit_background, daemon=True).start()
                 log.info("Automatic dataset schema audit started")
             try:
-                integrity_obj = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v2.json")
+                integrity_obj = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v3.json")
                 log.info("Existing row-level integrity report found (%s bytes)", integrity_obj.get("ContentLength"))
             except Exception:
                 threading.Thread(target=do_integrity_audit_background, daemon=True).start()
