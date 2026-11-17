@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import threading
 from datetime import datetime, timezone
@@ -6,12 +7,19 @@ from datetime import datetime, timezone
 import boto3
 import requests
 from botocore.config import Config
-from fastapi import FastAPI, HTTPException
+from botocore.exceptions import ClientError
+from fastapi import FastAPI, Header, HTTPException
 from huggingface_hub import HfApi, hf_hub_url
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("pmu-import")
 
 REPO = os.getenv("HF_DATASET", "annaelmoussa/horse-racing-france")
 IMPORT_TOKEN = os.getenv("IMPORT_TOKEN", "")
-app = FastAPI(title="PMU France data preparation", version="0.2.0")
+PREFIX = "raw/horse-racing-france/"
+STATE_KEY = PREFIX + "import-state.json"
+MANIFEST_KEY = PREFIX + "manifest.json"
+app = FastAPI(title="PMU France data preparation", version="0.3.0")
 lock = threading.Lock()
 state = {
     "phase": "idle", "started_at": None, "finished_at": None,
@@ -20,6 +28,46 @@ state = {
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+def s3_client():
+    required = ["S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"]
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        raise RuntimeError("Missing storage settings: " + ", ".join(missing))
+    return boto3.client(
+        "s3", endpoint_url=os.environ["S3_ENDPOINT"],
+        region_name=os.getenv("S3_REGION", "auto"),
+        aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
+        config=Config(s3={"addressing_style": "virtual"})
+    )
+
+def persist_state(s3=None):
+    s3 = s3 or s3_client()
+    s3.put_object(
+        Bucket=os.environ["S3_BUCKET"], Key=STATE_KEY,
+        Body=json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8"),
+        ContentType="application/json"
+    )
+
+def read_json_object(s3, key):
+    try:
+        obj = s3.get_object(Bucket=os.environ["S3_BUCKET"], Key=key)
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return None
+        raise
+
+def load_persisted_state():
+    try:
+        persisted = read_json_object(s3_client(), STATE_KEY)
+        if persisted:
+            state.update(persisted)
+    except Exception as exc:
+        log.warning("Persistent state unavailable: %s", str(exc)[:300])
+    return state
 
 def inspect_dataset():
     info = HfApi().dataset_info(REPO, files_metadata=True)
@@ -41,6 +89,7 @@ def health():
 
 @app.get("/status")
 def status():
+    load_persisted_state()
     return state
 
 @app.get("/inspect")
@@ -54,79 +103,129 @@ def inspect():
                 "configs": configs, "files": files, "parquet_count": len(files),
                 "total_bytes": sum(x["size"] or 0 for x in files), "error": None
             })
+            persist_state()
         return state
     except Exception as exc:
         with lock:
-            state.update({"phase": "error", "error": str(exc), "finished_at": now()})
-        raise HTTPException(status_code=502, detail=str(exc))
+            state.update({"phase": "error", "error": str(exc)[:1000], "finished_at": now()})
+            try: persist_state()
+            except Exception: pass
+        log.exception("Dataset inspection failed")
+        raise HTTPException(status_code=502, detail="Dataset inspection failed; see service logs")
 
 def do_import():
+    s3 = None
     try:
+        s3 = s3_client()
+        previous = read_json_object(s3, STATE_KEY) or {}
+        already = {x["path"]: x for x in previous.get("imported", []) if x.get("path")}
         with lock:
-            state.update({"phase": "importing", "started_at": now(), "finished_at": None,
-                          "imported": [], "error": None})
+            state.update(previous)
+            state.update({"phase": "importing", "started_at": state.get("started_at") or now(),
+                          "finished_at": None, "repo": REPO, "error": None})
+            state["imported"] = list(already.values())
+            persist_state(s3)
         files, configs = inspect_dataset()
-        required = ["S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"]
-        missing = [k for k in required if not os.getenv(k)]
-        if missing:
-            raise RuntimeError("Missing storage settings: " + ", ".join(missing))
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=os.environ["S3_ENDPOINT"],
-            region_name=os.getenv("S3_REGION", "auto"),
-            aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
-            config=Config(s3={"addressing_style": "virtual"})
-        )
-        bucket = os.environ["S3_BUCKET"]
         total = len(files)
         for index, item in enumerate(files, start=1):
             path = item["path"]
-            url = hf_hub_url(repo_id=REPO, filename=path, repo_type="dataset")
-            with requests.get(url, stream=True, timeout=(30, 600)) as response:
-                response.raise_for_status()
-                size = item["size"] or response.headers.get("Content-Length")
-                if size is None:
-                    raise RuntimeError("Unknown file size for " + path)
-                response.raw.decode_content = True
-                s3.put_object(
-                    Bucket=bucket,
-                    Key="raw/horse-racing-france/" + path,
-                    Body=response.raw,
-                    ContentLength=int(size)
-                )
+            key = PREFIX + path
+            try:
+                head = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=key)
+                expected = item.get("size")
+                if expected is not None and int(head.get("ContentLength", -1)) != int(expected):
+                    raise RuntimeError("Stored object size mismatch for " + path)
+                stored_bytes = int(head["ContentLength"])
+                already[path] = {"path": path, "bytes": stored_bytes, "verified": True}
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code not in ("404", "NoSuchKey", "NotFound"):
+                    raise
+                url = hf_hub_url(repo_id=REPO, filename=path, repo_type="dataset")
+                with requests.get(url, stream=True, timeout=(30, 900)) as response:
+                    response.raise_for_status()
+                    size = item.get("size") or response.headers.get("Content-Length")
+                    if size is None:
+                        raise RuntimeError("Unknown file size for " + path)
+                    response.raw.decode_content = True
+                    s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=key,
+                                  Body=response.raw, ContentLength=int(size))
+                head = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=key)
+                stored_bytes = int(head["ContentLength"])
+                if item.get("size") is not None and stored_bytes != int(item["size"]):
+                    raise RuntimeError("Post-upload size mismatch for " + path)
+                already[path] = {"path": path, "bytes": stored_bytes, "verified": True}
             with lock:
-                state["imported"].append({"path": path, "bytes": int(size)})
-                state["progress"] = {"completed": index, "total": total}
+                state.update({"phase": "importing", "configs": configs, "files": files,
+                              "imported": list(already.values()),
+                              "progress": {"completed": len(already), "total": total,
+                                           "current": path}, "error": None})
+                persist_state(s3)
+            log.info("Parquet file verified %s (%s/%s)", path, index, total)
+
         manifest = {
             "dataset": REPO, "imported_at": now(), "configs": configs,
-            "files": state["imported"],
-            "total_bytes": sum(x["bytes"] for x in state["imported"])
+            "files": sorted(already.values(), key=lambda x: x["path"]),
+            "total_files": len(already),
+            "total_bytes": sum(x["bytes"] for x in already.values())
         }
-        s3.put_object(
-            Bucket=bucket,
-            Key="raw/horse-racing-france/manifest.json",
-            Body=json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
-            ContentType="application/json"
-        )
+        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=MANIFEST_KEY,
+                      Body=json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+                      ContentType="application/json")
         with lock:
-            state.update({"phase": "imported", "finished_at": now(), "manifest": manifest})
+            state.update({"phase": "imported", "finished_at": now(),
+                          "manifest": manifest, "progress": {"completed": total, "total": total},
+                          "error": None})
+            persist_state(s3)
+        log.info("Dataset import completed: %s files, %s bytes", total, manifest["total_bytes"])
     except Exception as exc:
         with lock:
-            state.update({"phase": "error", "error": str(exc), "finished_at": now()})
+            state.update({"phase": "error", "error": str(exc)[:1000], "finished_at": now()})
+            try:
+                if s3: persist_state(s3)
+            except Exception as persist_exc:
+                log.error("Could not persist failure state: %s", str(persist_exc)[:300])
+        log.exception("Dataset import failed")
+
+def start_import_authorized():
+    load_persisted_state()
+    with lock:
+        if state.get("phase") == "imported":
+            return {"phase": "imported", "message": "Dataset already imported"}
+        if state.get("phase") == "importing":
+            return {"phase": "importing", "message": "Import already running"}
+        state.update({"phase": "queued", "started_at": now(), "finished_at": None, "error": None})
+        persist_state()
+    threading.Thread(target=do_import, daemon=True).start()
+    return {"phase": "queued", "message": "Import started; follow /status"}
+
+@app.post("/import/start")
+def start_import_header(x_import_token: str = Header(default="")):
+    if not IMPORT_TOKEN or x_import_token != IMPORT_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return start_import_authorized()
 
 @app.get("/import")
 def start_import(token: str):
     if not IMPORT_TOKEN or token != IMPORT_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
-    with lock:
-        if state["phase"] in ("importing", "imported"):
-            return {"phase": state["phase"], "message": "Import already started or completed"}
-        state.update({"phase": "queued", "started_at": now(), "error": None})
-    threading.Thread(target=do_import, daemon=True).start()
-    return {"phase": "queued", "message": "Import started; follow /status"}
+    return start_import_authorized()
+
+@app.get("/verify")
+def verify_storage():
+    try:
+        s3 = s3_client()
+        manifest = read_json_object(s3, MANIFEST_KEY)
+        response = s3.list_objects_v2(Bucket=os.environ["S3_BUCKET"], Prefix=PREFIX)
+        objects = [{"key": x["Key"], "bytes": x["Size"]} for x in response.get("Contents", [])]
+        return {"manifest_present": manifest is not None, "manifest": manifest,
+                "objects_seen_in_first_page": len(objects), "objects": objects}
+    except Exception as exc:
+        log.exception("Storage verification failed")
+        raise HTTPException(status_code=502, detail="Storage verification failed; see service logs")
 
 @app.get("/")
 def root():
     return {"message": "PMU France dataset preparation service",
-            "actions": ["GET /health", "GET /inspect", "GET /status", "GET /import?token=..."]}
+            "actions": ["GET /health", "GET /inspect", "GET /status",
+                        "POST /import/start (X-Import-Token header)", "GET /verify"]}
