@@ -294,7 +294,7 @@ def do_integrity_audit_background():
                       ContentType="application/json")
         log.info("Row-level integrity audit completed: status=%s course_rows=%s unique_course_keys=%s duplicate_course_keys=%s missing_course_keys=%s finalized_without_arrival=%s participant_rows=%s participant_orphans=%s report_rows=%s report_orphans=%s unique_reunion_keys=%s duplicate_reunion_keys=%s reunion_missing=%s runner_count_mismatches=%s mismatch_examples=%s",
                  report["status"], course_rows, len(course_keys), duplicate_course_keys, missing_course_key,
-                 finalized_without_arrival, participant_rows, orphan_report_rows, report_rows,
+                 finalized_without_arrival, participant_rows, orphan_participant_rows, report_rows,
                  orphan_report_rows, len(reunion_keys), duplicate_reunion_keys, missing_reunion_refs,
                  len(runner_count_mismatches), json.dumps(runner_count_mismatches[:25], ensure_ascii=False))
     except Exception:
