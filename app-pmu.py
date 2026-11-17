@@ -217,9 +217,9 @@ def do_integrity_audit_background():
         missing_course_key = 0
         finalized_without_arrival = 0
         course_rows = 0
-        for batch in batches("courses", ["raceKey", "reunionKey", "date", "numReunion", "hippodrome", "nombreDeclaresPartants", "arriveeDefinitive", "ordreArrivee"]):
+        for batch in batches("courses", ["raceKey", "reunionKey", "date", "hippodrome", "nombreDeclaresPartants", "arriveeDefinitive", "ordreArrivee"]):
             d = batch.to_pydict()
-            for rk, reunion, date, num_reunion, hippodrome, n, finalized, arrival in zip(d["raceKey"], d["reunionKey"], d["date"], d["numReunion"], d["hippodrome"], d["nombreDeclaresPartants"], d["arriveeDefinitive"], d["ordreArrivee"]):
+            for rk, reunion, date, hippodrome, n, finalized, arrival in zip(d["raceKey"], d["reunionKey"], d["date"], d["hippodrome"], d["nombreDeclaresPartants"], d["arriveeDefinitive"], d["ordreArrivee"]):
                 course_rows += 1
                 if not rk:
                     missing_course_key += 1
@@ -229,8 +229,8 @@ def do_integrity_audit_background():
                     course_keys.add(rk)
                 if reunion:
                     course_reunions.add(reunion)
-                if date and num_reunion is not None and hippodrome:
-                    course_meeting_keys.add((str(date), int(num_reunion), norm_hippo(hippodrome)))
+                if date and hippodrome:
+                    course_meeting_keys.add((str(date), norm_hippo(hippodrome)))
                 if rk:
                     declared[rk] = n
                 if finalized and not arrival:
@@ -255,7 +255,7 @@ def do_integrity_audit_background():
                         reunion_keys.add(key)
                         reunion_first_rows[key] = row
                 if row["date"] and row["numExterne"] is not None and row["hippodromeCourt"]:
-                    meeting_key = (str(row["date"]), int(row["numExterne"]), norm_hippo(row["hippodromeCourt"]))
+                    meeting_key = (str(row["date"]), norm_hippo(row["hippodromeCourt"]))
                     if meeting_key in reunion_meeting_keys:
                         duplicate_meeting_keys += 1
                         if len(duplicate_meeting_examples) < 25:
@@ -313,6 +313,7 @@ def do_integrity_audit_background():
             "joins": {
                 "legacy_reunionKey_missing": missing_reunion_refs,
                 "course_meeting_identity_missing": missing_meeting_refs,
+                "course_meeting_identity_key": "date + normalized hippodrome (numReunion and numExterne are not aligned)",
                 "course_meeting_identity_missing_examples": missing_meeting_examples,
                 "duplicate_meeting_identity_examples": duplicate_meeting_examples,
                 "participant_race_count_mismatches": len(runner_count_mismatches),
@@ -323,7 +324,7 @@ def do_integrity_audit_background():
                 "Payout rows are allowed to be absent for races without published payouts."
             ]
         }
-        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v7.json",
+        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v8.json",
                       Body=json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
                       ContentType="application/json")
         log.info("Row-level integrity audit completed: status=%s course_rows=%s unique_course_keys=%s duplicate_course_keys=%s missing_course_keys=%s finalized_without_arrival=%s participant_rows=%s participant_orphans=%s report_rows=%s report_orphans=%s unique_reunion_keys=%s duplicate_reunion_keys=%s reunion_missing=%s runner_count_mismatches=%s mismatch_examples=%s reunion_duplicate_examples=%s meeting_identity_missing=%s meeting_identity_examples=%s duplicate_meeting_identity=%s duplicate_meeting_examples=%s",
@@ -454,7 +455,7 @@ def verify_storage():
 def get_integrity_report():
     try:
         s3 = s3_client()
-        report = read_json_object(s3, PREFIX + "integrity-report-v7.json")
+        report = read_json_object(s3, PREFIX + "integrity-report-v8.json")
         if not report:
             return {"status": "pending", "message": "Integrity audit v7 has not completed"}
         return report
@@ -577,7 +578,7 @@ def resume_dataset_import():
                 threading.Thread(target=do_audit_background, daemon=True).start()
                 log.info("Automatic dataset schema audit started")
             try:
-                integrity_obj = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v7.json")
+                integrity_obj = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v8.json")
                 log.info("Existing row-level integrity report found (%s bytes)", integrity_obj.get("ContentLength"))
             except Exception:
                 threading.Thread(target=do_integrity_audit_background, daemon=True).start()
