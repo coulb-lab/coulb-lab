@@ -121,7 +121,7 @@ def main():
         metrics["LightGBM_LambdaMART"]={"error":repr(e)}
         model_preds={}
     # Binary top-five classifier baseline model; bounded sample for memory and runtime.
-    y5=(test["finish_rank"].notna()).astype("int8").to_numpy()
+    y5=(test["finish_rank"].fillna(999)<=5).astype("int8").to_numpy()
     try:
         from sklearn.ensemble import ExtraTreesClassifier
         rng=np.random.default_rng(SEED)
@@ -129,7 +129,7 @@ def main():
         if len(idx)>450000: idx=rng.choice(idx,450000,replace=False)
         clf=ExtraTreesClassifier(n_estimators=250,min_samples_leaf=4,max_features="sqrt",
                                  class_weight="balanced_subsample",n_jobs=-1,random_state=SEED)
-        clf.fit(Xtr.iloc[idx],(train.iloc[idx]["finish_rank"].notna()).astype("int8"))
+        clf.fit(Xtr.iloc[idx],(train.iloc[idx]["finish_rank"].fillna(999)<=5).astype("int8"))
         p=clf.predict_proba(Xte)[:,1]
         model_preds["ExtraTrees_top5_probability"]=p
         metrics["ExtraTrees_top5_probability"]={"train_sample_rows":len(idx)}
@@ -145,7 +145,7 @@ def main():
             order=np.argsort(-s)
             top1+=int(g.iloc[order[0]].finish_rank==1)
             top5+=int(np.any(g.iloc[order[:5]].finish_rank==1))
-            hit_top5+=int(np.sum(g.iloc[order[:5]].finish_rank.notna()))
+            hit_top5+=int(np.sum(g.iloc[order[:5]].finish_rank.fillna(999)<=5))
             nd.append(ndcg_score([rel],[s],k=5))
             n+=1
         return {"races":n,"winner_hit_rate":top1/n if n else None,
