@@ -1,4 +1,5 @@
 import json
+import io
 import logging
 import os
 import threading
@@ -10,6 +11,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, Header, HTTPException
 from huggingface_hub import HfApi, hf_hub_url
+import pyarrow.parquet as pq
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pmu-import")
@@ -223,6 +225,69 @@ def verify_storage():
     except Exception as exc:
         log.exception("Storage verification failed")
         raise HTTPException(status_code=502, detail="Storage verification failed; see service logs")
+
+
+@app.post("/audit")
+def audit_dataset(x_import_token: str = Header(default="")):
+    if not IMPORT_TOKEN or x_import_token != IMPORT_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        s3 = s3_client()
+        manifest = read_json_object(s3, MANIFEST_KEY)
+        if not manifest:
+            raise HTTPException(status_code=409, detail="Dataset manifest is not available")
+        tables = {}
+        errors = []
+        total_rows = 0
+        for item in manifest.get("files", []):
+            path = item["path"]
+            key = PREFIX + path
+            body = s3.get_object(Bucket=os.environ["S3_BUCKET"], Key=key)["Body"].read()
+            parquet = pq.ParquetFile(io.BytesIO(body))
+            table_name = path.split("/")[0] if "/" in path else "default"
+            entry = tables.setdefault(table_name, {
+                "files": 0, "rows": 0, "bytes": 0, "columns": None,
+                "schema": None, "row_groups": 0
+            })
+            schema = parquet.schema_arrow
+            columns = schema.names
+            if entry["columns"] is None:
+                entry["columns"] = columns
+                entry["schema"] = {field.name: str(field.type) for field in schema}
+            elif entry["columns"] != columns:
+                errors.append({"file": path, "error": "inconsistent_columns"})
+            entry["files"] += 1
+            entry["rows"] += parquet.metadata.num_rows
+            entry["bytes"] += len(body)
+            entry["row_groups"] += parquet.metadata.num_row_groups
+            total_rows += parquet.metadata.num_rows
+            required_key = "raceKey" if table_name in ("courses", "participants", "rapports") else None
+            if required_key and required_key not in columns:
+                errors.append({"file": path, "error": "missing_raceKey"})
+        report = {
+            "audited_at": now(), "dataset": REPO,
+            "manifest_files": len(manifest.get("files", [])),
+            "manifest_bytes": manifest.get("total_bytes"),
+            "audited_bytes": sum(x["bytes"] for x in tables.values()),
+            "total_rows": total_rows, "tables": tables,
+            "errors": errors,
+            "status": "schema_ok" if not errors else "schema_errors",
+            "limitations": [
+                "This first pass validates Parquet readability, schema consistency, row counts and key-column presence.",
+                "It does not yet prove uniqueness of raceKey or referential integrity across all rows."
+            ]
+        }
+        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "audit-report.json",
+                      Body=json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
+                      ContentType="application/json")
+        log.info("Dataset audit completed: %s files, %s rows, %s tables, %s schema errors",
+                 report["manifest_files"], total_rows, len(tables), len(errors))
+        return report
+    except HTTPException:
+        raise
+    except Exception:
+        log.exception("Dataset audit failed")
+        raise HTTPException(status_code=502, detail="Dataset audit failed; see service logs")
 
 @app.get("/")
 def root():
