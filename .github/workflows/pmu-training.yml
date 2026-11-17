@@ -3,6 +3,7 @@ on:
   push:
     paths:
       - "pmu_train.py"
+      - "lonaci_*.csv"
       - ".github/workflows/pmu-training.yml"
   workflow_dispatch:
 permissions:
@@ -26,7 +27,7 @@ jobs:
         env:
           HF_HUB_DISABLE_TELEMETRY: "1"
         run: python pmu_train.py
-      - name: Upload metrics
+      - name: Upload metrics and models
         if: always()
         uses: actions/upload-artifact@v4
         with:
