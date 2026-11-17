@@ -460,6 +460,21 @@ def verify_storage():
 
 
 
+
+@app.get("/dataset-schema")
+def get_dataset_schema():
+    try:
+        s3 = s3_client()
+        report = read_json_object(s3, PREFIX + "audit-report-v3.json")
+        if not report:
+            return {"status": "pending", "message": "Dataset schema audit is not available"}
+        return {"status": report.get("status"), "audited_at": report.get("audited_at"),
+                "total_rows": report.get("total_rows"), "tables": report.get("tables"),
+                "errors": report.get("errors")}
+    except Exception:
+        log.exception("Could not read dataset schema report")
+        raise HTTPException(status_code=502, detail="Could not read dataset schema report")
+
 @app.get("/integrity-report")
 def get_integrity_report():
     try:
