@@ -2,6 +2,7 @@ import ast, json, os, re, time
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import joblib
 from datasets import load_dataset
 from sklearn.metrics import ndcg_score, log_loss, brier_score_loss
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
@@ -79,17 +80,21 @@ def main():
     # Keep only features with valid data; encode categorical columns consistently.
     Xtr=train[features].copy(); Xva=valid[features].copy(); Xte=test[features].copy()
     categorical=[]
+    category_maps={}
+    numeric_medians={}
     for c in features:
         if Xtr[c].dtype=="object" or str(Xtr[c].dtype)=="category" or Xtr[c].dtype=="bool":
             categorical.append(c)
             vals=pd.concat([Xtr[c],Xva[c],Xte[c]],ignore_index=True).fillna("__NA__").astype(str)
             codes,uniques=pd.factorize(vals,sort=True)
+            category_maps[c]={str(v):int(i) for i,v in enumerate(uniques)}
             n1=len(Xtr); n2=len(Xva)
             Xtr[c]=codes[:n1]; Xva[c]=codes[n1:n1+n2]; Xte[c]=codes[n1+n2:]
         else:
             for X in (Xtr,Xva,Xte): X[c]=pd.to_numeric(X[c],errors="coerce")
             med=Xtr[c].median()
             if pd.isna(med): med=0
+            numeric_medians[c]=float(med)
             for X in (Xtr,Xva,Xte): X[c]=X[c].replace([np.inf,-np.inf],np.nan).fillna(med).astype("float32")
     # Exclude features that collapse to a single value.
     keep=[c for c in features if Xtr[c].nunique(dropna=False)>1]
@@ -118,6 +123,7 @@ def main():
                    eval_at=[1,3,5],callbacks=[lgb.early_stopping(40,verbose=False)])
         pred=ranker.predict(Xte)
         metrics["LightGBM_LambdaMART"]={"best_iteration":ranker.best_iteration_}
+        joblib.dump(ranker, OUT/"lightgbm_lambdamart.joblib")
         model_preds={"LightGBM_LambdaMART":pred}
     except Exception as e:
         metrics["LightGBM_LambdaMART"]={"error":repr(e)}
@@ -132,6 +138,7 @@ def main():
         clf=ExtraTreesClassifier(n_estimators=250,min_samples_leaf=4,max_features="sqrt",
                                  class_weight="balanced_subsample",n_jobs=-1,random_state=SEED)
         clf.fit(Xtr.iloc[idx],(train.iloc[idx]["finish_rank"].fillna(999)<=5).astype("int8"))
+        joblib.dump(clf, OUT/"extratrees_top5.joblib")
         p=clf.predict_proba(Xte)[:,1]
         model_preds["ExtraTrees_top5_probability"]=p
         metrics["ExtraTrees_top5_probability"]={"train_sample_rows":len(idx)}
@@ -156,6 +163,33 @@ def main():
                 "NDCG_at_5":float(np.mean(nd)) if nd else None}
     for name,pred in model_preds.items():
         if len(pred)==len(test): metrics[name].update(eval_pred(pred))
+    # Save preprocessing metadata for future inference.
+    metadata={"features":keep,"categorical":categorical,"category_maps":category_maps,
+              "numeric_medians":numeric_medians,"dataset":REPO}
+    with open(OUT/"preprocessing.json","w") as f: json.dump(metadata,f,indent=2,ensure_ascii=False)
+    # Apply the fitted models to a LONACI race card when present.
+    lonaci_path=Path("lonaci_2026-11-17_prix_beauvais.csv")
+    if lonaci_path.exists() and "LightGBM_LambdaMART" in model_preds:
+        card=pd.read_csv(lonaci_path)
+        Xin=pd.DataFrame(index=card.index)
+        for c in keep:
+            if c in categorical:
+                mapping=category_maps.get(c,{})
+                Xin[c]=card[c].fillna("__NA__").astype(str).map(mapping).fillna(-1).astype("int32")
+            else:
+                vals=pd.to_numeric(card[c],errors="coerce") if c in card else pd.Series(np.nan,index=card.index)
+                Xin[c]=vals.replace([np.inf,-np.inf],np.nan).fillna(numeric_medians.get(c,0)).astype("float32")
+        scores=ranker.predict(Xin[keep])
+        card["lightgbm_score"]=scores
+        card["lightgbm_rank"]=card["lightgbm_score"].rank(method="first",ascending=False).astype(int)
+        if "ExtraTrees_top5_probability" in model_preds:
+            pcard=clf.predict_proba(Xin[keep])[:,1]
+            card["extratrees_top5_probability"]=pcard
+            card["extratrees_rank"]=card["extratrees_top5_probability"].rank(method="first",ascending=False).astype(int)
+        card.sort_values("lightgbm_rank").to_csv(OUT/"lonaci_predictions.csv",index=False)
+        metrics["lonaci_application"]={"file":str(lonaci_path),"runners":len(card),
+            "lightgbm_top5":card.nsmallest(5,"lightgbm_rank")["horse_number"].astype(int).tolist(),
+            "missing_features_filled_from_training_medians":[c for c in keep if c not in card.columns]}
     # Persist reproducibility details and results.
     metrics["elapsed_seconds"]=round(time.time()-t0,1)
     with open(OUT/"metrics.json","w") as f: json.dump(metrics,f,indent=2,ensure_ascii=False,default=str)
