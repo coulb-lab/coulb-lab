@@ -172,6 +172,132 @@ def do_audit_background():
     except Exception:
         log.exception("Automatic dataset audit failed")
 
+
+def do_integrity_audit_background():
+    """Second-pass key and join audit; scans only key/count columns in Arrow batches."""
+    try:
+        s3 = s3_client()
+        manifest = read_json_object(s3, MANIFEST_KEY)
+        if not manifest:
+            log.warning("Integrity audit skipped: dataset manifest missing")
+            return
+        files_by_table = {"courses": [], "participants": [], "rapports": [], "reunions": []}
+        # Resolve each shard from its Arrow schema, not from directory names.
+        for item in manifest.get("files", []):
+            path = item["path"]
+            body = s3.get_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + path)["Body"].read()
+            pf = pq.ParquetFile(io.BytesIO(body))
+            cols = set(pf.schema_arrow.names)
+            if {"raceKey", "reunionKey", "ordreArrivee"}.issubset(cols):
+                table = "courses"
+            elif {"raceKey", "numPmu", "musique"}.issubset(cols):
+                table = "participants"
+            elif {"raceKey", "combinaison", "dividende"}.issubset(cols):
+                table = "rapports"
+            elif {"reunionKey", "coursesCount"}.issubset(cols):
+                table = "reunions"
+            else:
+                raise RuntimeError("Cannot classify Parquet shard by schema: " + path)
+            files_by_table[table].append((path, body))
+
+        def batches(table, columns):
+            for path, body in files_by_table[table]:
+                pf = pq.ParquetFile(io.BytesIO(body))
+                for batch in pf.iter_batches(batch_size=100000, columns=columns):
+                    yield batch
+
+        course_keys, course_reunions = set(), set()
+        declared = {}
+        duplicate_course_keys = 0
+        missing_course_key = 0
+        finalized_without_arrival = 0
+        course_rows = 0
+        for batch in batches("courses", ["raceKey", "reunionKey", "nombreDeclaresPartants", "arriveeDefinitive", "ordreArrivee"]):
+            d = batch.to_pydict()
+            for rk, reunion, n, finalized, arrival in zip(d["raceKey"], d["reunionKey"], d["nombreDeclaresPartants"], d["arriveeDefinitive"], d["ordreArrivee"]):
+                course_rows += 1
+                if not rk:
+                    missing_course_key += 1
+                elif rk in course_keys:
+                    duplicate_course_keys += 1
+                else:
+                    course_keys.add(rk)
+                if reunion:
+                    course_reunions.add(reunion)
+                if rk:
+                    declared[rk] = n
+                if finalized and not arrival:
+                    finalized_without_arrival += 1
+
+        reunion_keys, duplicate_reunion_keys = set(), 0
+        for batch in batches("reunions", ["reunionKey"]):
+            for key in batch.column(0).to_pylist():
+                if not key:
+                    continue
+                if key in reunion_keys:
+                    duplicate_reunion_keys += 1
+                reunion_keys.add(key)
+
+        participant_rows = 0
+        orphan_participant_rows = 0
+        participant_count_by_race = {}
+        for batch in batches("participants", ["raceKey"]):
+            for key in batch.column(0).to_pylist():
+                participant_rows += 1
+                if not key or key not in course_keys:
+                    orphan_participant_rows += 1
+                else:
+                    participant_count_by_race[key] = participant_count_by_race.get(key, 0) + 1
+
+        report_rows = 0
+        orphan_report_rows = 0
+        for batch in batches("rapports", ["raceKey"]):
+            for key in batch.column(0).to_pylist():
+                report_rows += 1
+                if not key or key not in course_keys:
+                    orphan_report_rows += 1
+
+        missing_reunion_refs = sum(1 for key in course_reunions if key not in reunion_keys)
+        runner_count_mismatches = [
+            {"raceKey": key, "declared": count, "observed": participant_count_by_race.get(key, 0)}
+            for key, count in declared.items()
+            if count is not None and participant_count_by_race.get(key, 0) != count
+        ]
+        report = {
+            "audited_at": now(),
+            "dataset": REPO,
+            "status": "integrity_ok" if not any([
+                duplicate_course_keys, missing_course_key, duplicate_reunion_keys,
+                orphan_participant_rows, orphan_report_rows, missing_reunion_refs,
+                len(runner_count_mismatches)
+            ]) else "integrity_issues",
+            "tables": {
+                "courses": {"rows": course_rows, "unique_raceKey": len(course_keys),
+                            "duplicate_raceKey": duplicate_course_keys, "missing_raceKey": missing_course_key,
+                            "finalized_without_arrival": finalized_without_arrival},
+                "participants": {"rows": participant_rows, "orphan_raceKey_rows": orphan_participant_rows},
+                "rapports": {"rows": report_rows, "orphan_raceKey_rows": orphan_report_rows},
+                "reunions": {"unique_reunionKey": len(reunion_keys), "duplicate_reunionKey": duplicate_reunion_keys}
+            },
+            "joins": {
+                "course_reunion_keys_missing": missing_reunion_refs,
+                "participant_race_count_mismatches": len(runner_count_mismatches),
+                "participant_race_count_mismatch_examples": runner_count_mismatches[:25]
+            },
+            "limitations": [
+                "This audit validates key uniqueness and referential integrity, not the historical point-in-time availability of every participant feature.",
+                "Payout rows are allowed to be absent for races without published payouts."
+            ]
+        }
+        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v1.json",
+                      Body=json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
+                      ContentType="application/json")
+        log.info("Row-level integrity audit completed: status=%s course_keys=%s participant_orphans=%s report_orphans=%s reunion_missing=%s runner_count_mismatches=%s",
+                 report["status"], len(course_keys), orphan_participant_rows, orphan_report_rows,
+                 missing_reunion_refs, len(runner_count_mismatches))
+    except Exception:
+        log.exception("Row-level integrity audit failed")
+
 def do_import():
     s3 = None
     try:
