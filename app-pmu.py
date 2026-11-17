@@ -238,14 +238,38 @@ def resume_dataset_import():
         s3 = s3_client()
         manifest = read_json_object(s3, MANIFEST_KEY)
         if manifest:
+            files = manifest.get("files", [])
+            missing = []
+            verified_bytes = 0
+            for item in files:
+                key = PREFIX + item["path"]
+                try:
+                    head = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=key)
+                    actual = int(head.get("ContentLength", -1))
+                    expected = int(item.get("bytes", -1))
+                    if actual != expected:
+                        missing.append({"path": item["path"], "reason": "size_mismatch",
+                                        "expected": expected, "actual": actual})
+                    else:
+                        verified_bytes += actual
+                except Exception as exc:
+                    missing.append({"path": item.get("path"), "reason": str(exc)[:250]})
             state.update({
-                "phase": "imported", "manifest": manifest,
-                "imported": manifest.get("files", []),
-                "progress": {"completed": manifest.get("total_files", 0),
-                             "total": manifest.get("total_files", 0)},
-                "finished_at": manifest.get("imported_at")
+                "phase": "imported" if not missing else "verification_error",
+                "manifest": manifest, "imported": files,
+                "progress": {"completed": len(files) - len(missing),
+                             "total": len(files)},
+                "finished_at": manifest.get("imported_at"),
+                "verification": {"verified_files": len(files) - len(missing),
+                                 "missing_or_invalid": missing,
+                                 "verified_bytes": verified_bytes}
             })
-            log.info("Existing dataset manifest found; import will not be repeated")
+            log.info("Persistent dataset audit: %s/%s files verified; %s bytes; %s invalid",
+                     len(files) - len(missing), len(files), verified_bytes, len(missing))
+            if missing:
+                log.error("Dataset manifest verification failures: %s", json.dumps(missing)[:2000])
+            else:
+                log.info("All manifest objects verified; import will not be repeated")
             return
         previous = read_json_object(s3, STATE_KEY) or {}
         state.update(previous)
