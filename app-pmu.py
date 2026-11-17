@@ -115,6 +115,52 @@ def inspect():
         log.exception("Dataset inspection failed")
         raise HTTPException(status_code=502, detail="Dataset inspection failed; see service logs")
 
+def do_audit_background():
+    try:
+        s3 = s3_client()
+        manifest = read_json_object(s3, MANIFEST_KEY)
+        if not manifest:
+            log.warning("Automatic audit skipped: dataset manifest missing")
+            return
+        tables, errors, total_rows = {}, [], 0
+        for item in manifest.get("files", []):
+            path = item["path"]
+            body = s3.get_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + path)["Body"].read()
+            parquet = pq.ParquetFile(io.BytesIO(body))
+            table_name = path.split("/")[0] if "/" in path else "default"
+            entry = tables.setdefault(table_name, {"files": 0, "rows": 0, "bytes": 0,
+                                                    "columns": None, "schema": None, "row_groups": 0})
+            schema = parquet.schema_arrow
+            columns = schema.names
+            if entry["columns"] is None:
+                entry["columns"] = columns
+                entry["schema"] = {field.name: str(field.type) for field in schema}
+            elif entry["columns"] != columns:
+                errors.append({"file": path, "error": "inconsistent_columns"})
+            entry["files"] += 1
+            entry["rows"] += parquet.metadata.num_rows
+            entry["bytes"] += len(body)
+            entry["row_groups"] += parquet.metadata.num_row_groups
+            total_rows += parquet.metadata.num_rows
+            if table_name in ("courses", "participants", "rapports") and "raceKey" not in columns:
+                errors.append({"file": path, "error": "missing_raceKey"})
+        report = {
+            "audited_at": now(), "dataset": REPO,
+            "manifest_files": len(manifest.get("files", [])),
+            "manifest_bytes": manifest.get("total_bytes"),
+            "audited_bytes": sum(x["bytes"] for x in tables.values()),
+            "total_rows": total_rows, "tables": tables, "errors": errors,
+            "status": "schema_ok" if not errors else "schema_errors",
+            "limitations": ["Schema/readability/row-count audit only; exact key uniqueness and referential integrity require a second row-level pass."]
+        }
+        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "audit-report.json",
+                      Body=json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
+                      ContentType="application/json")
+        log.info("Automatic dataset audit completed: %s files, %s rows, %s tables, %s errors",
+                 report["manifest_files"], total_rows, len(tables), len(errors))
+    except Exception:
+        log.exception("Automatic dataset audit failed")
+
 def do_import():
     s3 = None
     try:
@@ -335,6 +381,12 @@ def resume_dataset_import():
                 log.error("Dataset manifest verification failures: %s", json.dumps(missing)[:2000])
             else:
                 log.info("All manifest objects verified; import will not be repeated")
+            try:
+                audit_obj = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "audit-report.json")
+                log.info("Existing dataset audit report found (%s bytes)", audit_obj.get("ContentLength"))
+            except Exception:
+                threading.Thread(target=do_audit_background, daemon=True).start()
+                log.info("Automatic dataset schema audit started")
             return
         previous = read_json_object(s3, STATE_KEY) or {}
         state.update(previous)
