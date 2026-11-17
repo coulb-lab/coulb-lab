@@ -524,6 +524,12 @@ def resume_dataset_import():
             except Exception:
                 threading.Thread(target=do_audit_background, daemon=True).start()
                 log.info("Automatic dataset schema audit started")
+            try:
+                integrity_obj = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v1.json")
+                log.info("Existing row-level integrity report found (%s bytes)", integrity_obj.get("ContentLength"))
+            except Exception:
+                threading.Thread(target=do_integrity_audit_background, daemon=True).start()
+                log.info("Automatic row-level integrity audit started")
             return
         previous = read_json_object(s3, STATE_KEY) or {}
         state.update(previous)
