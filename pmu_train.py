@@ -47,6 +47,8 @@ def main():
         for rank, num in enumerate(arr, start=1):
             rank_rows.append((rk, int(num), rank))
     targets=pd.DataFrame(rank_rows,columns=["raceKey","numPmu_num","finish_rank"])
+    # Participants also carry a date column; remove it so the canonical course date is joined once.
+    runners=runners.drop(columns=["date"],errors="ignore")
     data=runners.merge(targets,on=["raceKey","numPmu_num"],how="left",validate="many_to_one")
     data=data.merge(courses[["raceKey","date","year","discipline","specialite","hippodrome","distance","montantPrix","nombreDeclaresPartants","corde","categorieParticularite","conditionAge","conditionSexe"]].drop_duplicates("raceKey"),on="raceKey",how="inner",validate="many_to_one")
     # Only pre-race features. Arrival, payout and all post-race/target fields are forbidden.
