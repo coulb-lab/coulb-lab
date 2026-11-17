@@ -229,3 +229,33 @@ def root():
     return {"message": "PMU France dataset preparation service",
             "actions": ["GET /health", "GET /inspect", "GET /status",
                         "POST /import/start (X-Import-Token header)", "GET /verify"]}
+
+
+@app.on_event("startup")
+def resume_dataset_import():
+    """Automatically resume the one-time dataset import after deployment/restart."""
+    try:
+        s3 = s3_client()
+        manifest = read_json_object(s3, MANIFEST_KEY)
+        if manifest:
+            state.update({
+                "phase": "imported", "manifest": manifest,
+                "imported": manifest.get("files", []),
+                "progress": {"completed": manifest.get("total_files", 0),
+                             "total": manifest.get("total_files", 0)},
+                "finished_at": manifest.get("imported_at")
+            })
+            log.info("Existing dataset manifest found; import will not be repeated")
+            return
+        previous = read_json_object(s3, STATE_KEY) or {}
+        state.update(previous)
+        if state.get("phase") == "importing":
+            log.info("Resuming interrupted dataset import from persistent progress")
+        else:
+            state.update({"phase": "queued", "started_at": now(),
+                          "finished_at": None, "error": None})
+        persist_state(s3)
+        threading.Thread(target=do_import, daemon=True).start()
+        log.info("Dataset import/resume task started automatically")
+    except Exception:
+        log.exception("Automatic dataset import could not start")
