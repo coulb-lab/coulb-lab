@@ -230,13 +230,22 @@ def do_integrity_audit_background():
                     finalized_without_arrival += 1
 
         reunion_keys, duplicate_reunion_keys = set(), 0
-        for batch in batches("reunions", ["reunionKey"]):
-            for key in batch.column(0).to_pylist():
+        reunion_first_rows, reunion_duplicate_examples = {}, []
+        reunion_columns = ["reunionKey", "date", "numExterne", "nature", "hippodromeCode", "hippodromeCourt"]
+        for batch in batches("reunions", reunion_columns):
+            d = batch.to_pydict()
+            for values in zip(*(d[name] for name in reunion_columns)):
+                row = dict(zip(reunion_columns, values))
+                key = row["reunionKey"]
                 if not key:
                     continue
                 if key in reunion_keys:
                     duplicate_reunion_keys += 1
-                reunion_keys.add(key)
+                    if len(reunion_duplicate_examples) < 25:
+                        reunion_duplicate_examples.append({"first": reunion_first_rows[key], "duplicate": row})
+                else:
+                    reunion_keys.add(key)
+                    reunion_first_rows[key] = row
 
         participant_rows = 0
         orphan_participant_rows = 0
@@ -277,7 +286,8 @@ def do_integrity_audit_background():
                             "finalized_without_arrival": finalized_without_arrival},
                 "participants": {"rows": participant_rows, "orphan_raceKey_rows": orphan_participant_rows},
                 "rapports": {"rows": report_rows, "orphan_raceKey_rows": orphan_report_rows},
-                "reunions": {"unique_reunionKey": len(reunion_keys), "duplicate_reunionKey": duplicate_reunion_keys}
+                "reunions": {"unique_reunionKey": len(reunion_keys), "duplicate_reunionKey": duplicate_reunion_keys,
+                             "duplicate_reunion_examples": reunion_duplicate_examples}
             },
             "joins": {
                 "course_reunion_keys_missing": missing_reunion_refs,
@@ -289,14 +299,15 @@ def do_integrity_audit_background():
                 "Payout rows are allowed to be absent for races without published payouts."
             ]
         }
-        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v3.json",
+        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v4.json",
                       Body=json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
                       ContentType="application/json")
-        log.info("Row-level integrity audit completed: status=%s course_rows=%s unique_course_keys=%s duplicate_course_keys=%s missing_course_keys=%s finalized_without_arrival=%s participant_rows=%s participant_orphans=%s report_rows=%s report_orphans=%s unique_reunion_keys=%s duplicate_reunion_keys=%s reunion_missing=%s runner_count_mismatches=%s mismatch_examples=%s",
+        log.info("Row-level integrity audit completed: status=%s course_rows=%s unique_course_keys=%s duplicate_course_keys=%s missing_course_keys=%s finalized_without_arrival=%s participant_rows=%s participant_orphans=%s report_rows=%s report_orphans=%s unique_reunion_keys=%s duplicate_reunion_keys=%s reunion_missing=%s runner_count_mismatches=%s mismatch_examples=%s reunion_duplicate_examples=%s",
                  report["status"], course_rows, len(course_keys), duplicate_course_keys, missing_course_key,
                  finalized_without_arrival, participant_rows, orphan_participant_rows, report_rows,
                  orphan_report_rows, len(reunion_keys), duplicate_reunion_keys, missing_reunion_refs,
-                 len(runner_count_mismatches), json.dumps(runner_count_mismatches[:25], ensure_ascii=False))
+                 len(runner_count_mismatches), json.dumps(runner_count_mismatches[:25], ensure_ascii=False),
+                 json.dumps(reunion_duplicate_examples, ensure_ascii=False))
     except Exception:
         log.exception("Row-level integrity audit failed")
 
@@ -527,7 +538,7 @@ def resume_dataset_import():
                 threading.Thread(target=do_audit_background, daemon=True).start()
                 log.info("Automatic dataset schema audit started")
             try:
-                integrity_obj = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v3.json")
+                integrity_obj = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v4.json")
                 log.info("Existing row-level integrity report found (%s bytes)", integrity_obj.get("ContentLength"))
             except Exception:
                 threading.Thread(target=do_integrity_audit_background, daemon=True).start()
