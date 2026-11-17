@@ -163,12 +163,12 @@ def do_audit_background():
             "status": "schema_ok" if not errors else "schema_errors",
             "limitations": ["Schema/readability/row-count audit only; exact key uniqueness and referential integrity require a second row-level pass."]
         }
-        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "audit-report-v2.json",
+        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "audit-report-v3.json",
                       Body=json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
                       ContentType="application/json")
-        log.info("Automatic dataset audit v2 completed: %s files, %s rows, %s schema groups, %s errors; files=%s; errors=%s",
+        log.info("Automatic dataset audit v3 completed: %s files, %s rows, %s tables, %s errors; table_schemas=%s; errors=%s",
                  report["manifest_files"], total_rows, len(tables), len(errors),
-                 [x["file"] for x in file_details], errors[:20])
+                 {name: {"rows": info["rows"], "columns": info["columns"], "schema": info["schema"]} for name, info in tables.items()}, errors[:20])
     except Exception:
         log.exception("Automatic dataset audit failed")
 
@@ -393,7 +393,7 @@ def resume_dataset_import():
             else:
                 log.info("All manifest objects verified; import will not be repeated")
             try:
-                audit_obj = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "audit-report-v2.json")
+                audit_obj = s3.head_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "audit-report-v3.json")
                 log.info("Existing dataset audit report found (%s bytes)", audit_obj.get("ContentLength"))
             except Exception:
                 threading.Thread(target=do_audit_background, daemon=True).start()
