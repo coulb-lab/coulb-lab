@@ -9,6 +9,7 @@ state={'phase':'idle','started_at':None,'finished_at':None,'files':[],'error':No
 def health(): return {'ok':True,'service':'pmu-data-training','time':datetime.now(timezone.utc).isoformat()}
 @app.get('/status')
 def status(): return state
+@app.get('/inspect')
 @app.post('/inspect')
 def inspect():
  state.update({'phase':'inspecting','started_at':datetime.now(timezone.utc).isoformat(),'error':None})
