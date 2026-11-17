@@ -239,6 +239,7 @@ def do_integrity_audit_background():
         reunion_keys, duplicate_reunion_keys = set(), 0
         reunion_meeting_keys, duplicate_meeting_keys = set(), 0
         reunion_first_rows, reunion_duplicate_examples = {}, []
+        reunion_first_meeting_rows, duplicate_meeting_examples = {}, []
         reunion_columns = ["reunionKey", "date", "numExterne", "nature", "hippodromeCode", "hippodromeCourt"]
         for batch in batches("reunions", reunion_columns):
             d = batch.to_pydict()
@@ -257,8 +258,14 @@ def do_integrity_audit_background():
                     meeting_key = (str(row["date"]), int(row["numExterne"]), norm_hippo(row["hippodromeCourt"]))
                     if meeting_key in reunion_meeting_keys:
                         duplicate_meeting_keys += 1
+                        if len(duplicate_meeting_examples) < 25:
+                            duplicate_meeting_examples.append({"first": reunion_first_meeting_rows[meeting_key], "duplicate": row})
+                    else:
+                        reunion_first_meeting_rows[meeting_key] = row
                     reunion_meeting_keys.add(meeting_key)
-        missing_meeting_refs = len(course_meeting_keys - reunion_meeting_keys)
+        missing_meeting_identities = sorted(course_meeting_keys - reunion_meeting_keys)
+        missing_meeting_refs = len(missing_meeting_identities)
+        missing_meeting_examples = missing_meeting_identities[:40]
 
         participant_rows = 0
         orphan_participant_rows = 0
@@ -317,7 +324,7 @@ def do_integrity_audit_background():
         s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=PREFIX + "integrity-report-v5.json",
                       Body=json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
                       ContentType="application/json")
-        log.info("Row-level integrity audit completed: status=%s course_rows=%s unique_course_keys=%s duplicate_course_keys=%s missing_course_keys=%s finalized_without_arrival=%s participant_rows=%s participant_orphans=%s report_rows=%s report_orphans=%s unique_reunion_keys=%s duplicate_reunion_keys=%s reunion_missing=%s runner_count_mismatches=%s mismatch_examples=%s reunion_duplicate_examples=%s meeting_identity_missing=%s duplicate_meeting_identity=%s",
+        log.info("Row-level integrity audit completed: status=%s course_rows=%s unique_course_keys=%s duplicate_course_keys=%s missing_course_keys=%s finalized_without_arrival=%s participant_rows=%s participant_orphans=%s report_rows=%s report_orphans=%s unique_reunion_keys=%s duplicate_reunion_keys=%s reunion_missing=%s runner_count_mismatches=%s mismatch_examples=%s reunion_duplicate_examples=%s meeting_identity_missing=%s meeting_identity_examples=%s duplicate_meeting_identity=%s duplicate_meeting_examples=%s",
                  report["status"], course_rows, len(course_keys), duplicate_course_keys, missing_course_key,
                  finalized_without_arrival, participant_rows, orphan_participant_rows, report_rows,
                  orphan_report_rows, len(reunion_keys), duplicate_reunion_keys, missing_reunion_refs,
