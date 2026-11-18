@@ -52,13 +52,33 @@ def main():
     runners=runners.drop(columns=["date"],errors="ignore")
     data=runners.merge(targets,on=["raceKey","numPmu_num"],how="left",validate="many_to_one")
     data=data.merge(courses[["raceKey","date","year","discipline","specialite","hippodrome","distance","montantPrix","nombreDeclaresPartants","corde","categorieParticularite","conditionAge","conditionSexe"]].drop_duplicates("raceKey"),on="raceKey",how="inner",validate="many_to_one")
-    # Only pre-race features. Arrival, payout and all post-race/target fields are forbidden.
-    forbidden=re.compile(r"(arrivee|ordre|place|position|rang|resultat|rapport|dividende|temps_final|reduction_km|ecart_arrivee|finish|winner|target|label)",re.I)
-    id_cols={"raceKey","reunionKey","numPmu","numPmu_num","date","year","finish_rank","arrival_list","ordreArrivee","arriveeDefinitive"}
-    candidates=[c for c in data.columns if c not in id_cols and not forbidden.search(c)]
-    # Exclude free-text identifiers likely to memorize an individual runner; retain form/history and race conditions.
-    candidates=[c for c in candidates if c.lower() not in {"nom","nom_cheval","cheval","horse","raw","commentaire"}]
-    # Drop mostly empty columns and unsupported nested objects.
+    # Engineer pre-race recent-form summaries (from the runner's historic form string).
+    def parse_form(v):
+        if not isinstance(v,str): return []
+        toks=re.findall(r"(?:^|[\\s,;])([0-9]+|[DA])(?:[a-z])?(?=$|[\\s,;])",v.upper())
+        out=[]
+        for tok in toks[:12]:
+            if tok.isdigit():
+                n=int(tok); out.append(10 if n==0 else min(n,9))
+            else: out.append(11)
+        return out
+    if "musique" in data.columns:
+        forms=data["musique"].map(parse_form)
+        data["form_last"]=forms.map(lambda x:x[0] if x else np.nan)
+        data["form_mean3"]=forms.map(lambda x:float(np.mean(x[:3])) if x else np.nan)
+        data["form_mean5"]=forms.map(lambda x:float(np.mean(x[:5])) if x else np.nan)
+        data["form_best5"]=forms.map(lambda x:min(x[:5]) if x else np.nan)
+        data["form_count"]=forms.map(len).astype("float32")
+        data["form_good3_rate"]=forms.map(lambda x:sum(v<=3 for v in x[:5])/max(1,len(x[:5])) if x else np.nan)
+    # Audited pre-race feature whitelist. Post-race incident/status fields excluded.
+    whitelist={"age","sexe","race","poids","handicapDistance","driver","jockey","entraineur",
+        "proprietaire","nombreCourses","nombreVictoires","nombrePlaces","gainsCarriere","placeCorde",
+        "numReunion","numCourse","distance","montantPrix","nombreDeclaresPartants","discipline",
+        "specialite","hippodrome","corde","categorieParticularite","conditionAge","conditionSexe",
+        "form_last","form_mean3","form_mean5","form_best5","form_count","form_good3_rate"}
+    forbidden=re.compile(r"(arrivee|ordre|position|rang|resultat|rapport|dividende|temps_final|reduction_km|ecart_arrivee|finish|winner|target|label|incident|statut)",re.I)
+    id_cols={"raceKey","reunionKey","numPmu","numPmu_num","date","year","finish_rank","arrival_list","ordreArrivee","arriveeDefinitive","nom","musique"}
+    candidates=[c for c in data.columns if c in whitelist and c not in id_cols and not forbidden.search(c)]
     features=[]
     for c in candidates:
         s=data[c]
