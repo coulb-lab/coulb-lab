@@ -55,7 +55,7 @@ def main():
     # Engineer pre-race recent-form summaries (from the runner's historic form string).
     def parse_form(v):
         if not isinstance(v,str): return []
-        toks=re.findall(r"(?:^|[\s,;])([0-9]+|[DA])(?:[a-z])?(?=$|[\s,;])",v.upper())
+        toks=re.findall(r"(?<![0-9])([0-9]+|[DA])(?:[a-z])?",v.upper())
         out=[]
         for tok in toks[:12]:
             if tok.isdigit():
