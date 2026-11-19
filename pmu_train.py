@@ -55,15 +55,16 @@ def main():
     # Engineer pre-race recent-form summaries (from the runner's historic form string).
     def parse_form(v):
         if not isinstance(v,str): return []
-        toks=re.findall(r"(?:^|[\\s,;])([0-9]+|[DA])(?:[a-z])?(?=$|[\\s,;])",v.upper())
+        toks=re.findall(r"(?:^|[\s,;])([0-9]+|[DA])(?:[a-z])?(?=$|[\s,;])",v.upper())
         out=[]
         for tok in toks[:12]:
             if tok.isdigit():
                 n=int(tok); out.append(10 if n==0 else min(n,9))
             else: out.append(11)
         return out
-    if "musique" in data.columns:
-        forms=data["musique"].map(parse_form)
+    form_col = next((c for c in ["musique", "form_pre_race"] if c in data.columns), None)
+    if form_col:
+        forms=data[form_col].map(parse_form)
         data["form_last"]=forms.map(lambda x:x[0] if x else np.nan)
         data["form_mean3"]=forms.map(lambda x:float(np.mean(x[:3])) if x else np.nan)
         data["form_mean5"]=forms.map(lambda x:float(np.mean(x[:5])) if x else np.nan)
@@ -187,29 +188,43 @@ def main():
     metadata={"features":keep,"categorical":categorical,"category_maps":category_maps,
               "numeric_medians":numeric_medians,"dataset":REPO}
     with open(OUT/"preprocessing.json","w") as f: json.dump(metadata,f,indent=2,ensure_ascii=False)
-    # Apply the fitted models to a LONACI race card when present.
-    lonaci_path=Path("lonaci_2026-11-17_prix_beauvais.csv")
-    if lonaci_path.exists() and "LightGBM_LambdaMART" in model_preds:
+    # Apply fitted models to every supplied LONACI card (arrival columns are never features).
+    lonaci_files=sorted(Path(".").glob("lonaci_*.csv"))
+    applications=[]
+    for lonaci_path in lonaci_files:
         card=pd.read_csv(lonaci_path)
+        # Build the same recent-form variables from the card's pre-race form string.
+        card_form_col=next((c for c in ["form_pre_race","musique"] if c in card.columns),None)
+        if card_form_col:
+            cforms=card[card_form_col].map(parse_form)
+            card["form_last"]=cforms.map(lambda x:x[0] if x else np.nan)
+            card["form_mean3"]=cforms.map(lambda x:float(np.mean(x[:3])) if x else np.nan)
+            card["form_mean5"]=cforms.map(lambda x:float(np.mean(x[:5])) if x else np.nan)
+            card["form_best5"]=cforms.map(lambda x:min(x[:5]) if x else np.nan)
+            card["form_count"]=cforms.map(len).astype("float32")
+            card["form_good3_rate"]=cforms.map(lambda x:sum(v<=3 for v in x[:5])/max(1,len(x[:5])) if x else np.nan)
         Xin=pd.DataFrame(index=card.index)
         for c in keep:
             if c in categorical:
                 mapping=category_maps.get(c,{})
-                Xin[c]=card[c].fillna("__NA__").astype(str).map(mapping).fillna(-1).astype("int32")
+                Xin[c]=card[c].fillna("__NA__").astype(str).map(mapping).fillna(-1).astype("int32") if c in card else -1
             else:
                 vals=pd.to_numeric(card[c],errors="coerce") if c in card else pd.Series(np.nan,index=card.index)
                 Xin[c]=vals.replace([np.inf,-np.inf],np.nan).fillna(numeric_medians.get(c,0)).astype("float32")
-        scores=ranker.predict(Xin[keep])
-        card["lightgbm_score"]=scores
-        card["lightgbm_rank"]=card["lightgbm_score"].rank(method="first",ascending=False).astype(int)
+        if "LightGBM_LambdaMART" in model_preds:
+            scores=ranker.predict(Xin[keep])
+            card["lightgbm_score"]=scores
+            card["lightgbm_rank"]=card["lightgbm_score"].rank(method="first",ascending=False).astype(int)
         if "ExtraTrees_top5_probability" in model_preds:
             pcard=clf.predict_proba(Xin[keep])[:,1]
             card["extratrees_top5_probability"]=pcard
             card["extratrees_rank"]=card["extratrees_top5_probability"].rank(method="first",ascending=False).astype(int)
-        card.sort_values("lightgbm_rank").to_csv(OUT/"lonaci_predictions.csv",index=False)
-        metrics["lonaci_application"]={"file":str(lonaci_path),"runners":len(card),
-            "lightgbm_top5":card.nsmallest(5,"lightgbm_rank")["horse_number"].astype(int).tolist(),
-            "missing_features_filled_from_training_medians":[c for c in keep if c not in card.columns]}
+        outpath=OUT/f"{lonaci_path.stem}_predictions.csv"
+        card.sort_values("lightgbm_rank" if "lightgbm_rank" in card else "extratrees_rank").to_csv(outpath,index=False)
+        applications.append({"file":str(lonaci_path),"runners":len(card),
+            "lightgbm_top5":card.nsmallest(5,"lightgbm_rank")["horse_number"].astype(int).tolist() if "lightgbm_rank" in card and "horse_number" in card else None,
+            "missing_features_filled_from_training_medians":[c for c in keep if c not in card.columns]})
+    if applications: metrics["lonaci_applications"]=applications
     # Persist reproducibility details and results.
     metrics["elapsed_seconds"]=round(time.time()-t0,1)
     with open(OUT/"metrics.json","w") as f: json.dump(metrics,f,indent=2,ensure_ascii=False,default=str)
